@@ -21,24 +21,41 @@ import sqlite3
 import time
 import cv2
 import numpy as np
+import torch
+import math
 from pathlib import Path
 from ultralytics import YOLO
 
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def resolve_model_path() -> Path:
+    """选择首个存在的模型文件，兼容不同版本命名。"""
+    candidates = [
+        BASE_DIR / "im30000best.pt",
+        BASE_DIR / "bestm.pt",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    return candidates[0]
+
 # ───── 配置 ─────────────────────────────────────────────────
-MODEL_PATH   = Path("im6000best.pt")
-VIDEO_DIR    = Path("orgin-video")
+MODEL_PATH   = resolve_model_path()
+VIDEO_DIR    = BASE_DIR / "orgin_video_0915"
 TARGET_WIDTH = 640          # 裁剪区域插值放大到的宽度
 CONF_THRESH  = 0.25
 IOU_THRESH   = 0.45
 SPEED_MULT   = 10            # 播放倍速（跳帧数），5 = 5倍速
 INFER_EVERY  = 1            # 每显示 N 帧推理一次（在跳帧基础上再稀疏推理）
 MAX_SPEED    = True         # True = 以最大处理速度显示，不限帧率；False = 按倍速限速
-SHOW_VIDEO   = True        # True = 每帧都显示；False = 限速 PREVIEW_FPS 显示
+SHOW_VIDEO   = False        # True = 每帧都显示；False = 限速 PREVIEW_FPS 显示
 PREVIEW_FPS  = 15          # SHOW_VIDEO=False 时的预览帧率（帧/秒）
 USE_HALF     = True         # FP16 半精度推理（需要 NVIDIA GPU），速度约提升 1.5-2x
 DB_BATCH     = 4096           # 积攒多少条推理结果后批量写入数据库（减少 I/O 阻塞）
-DB_PATH      = Path("infer_results.db")   # SQLite 数据库路径
-INFER_BATCH  = 32           # GPU 批量推理大小（>1 启用批推理，每积攒 N 张 crop 统一推理；1=逐帧推理）
+DB_PATH      = BASE_DIR / "infer_results_0915.db"   # SQLite 数据库路径
+INFER_BATCH  = 1           # GPU 批量推理大小（小显存建议 1-4；1=逐帧推理）
+OOM_MIN_IMGSZ = 320         # CUDA OOM 时允许自动降到的最小 imgsz
 # 插值算法：nearest / linear / cubic / area / lanczos
 #   nearest  — 最快，质量最低（像素化）
 #   linear   — 快速，质量适中（推荐速度优先时使用）
@@ -56,6 +73,11 @@ _INTERP_MAP = {
     "lanczos": cv2.INTER_LANCZOS4,
 }
 _interp_flag = _INTERP_MAP.get(INTERP.lower(), cv2.INTER_CUBIC)
+
+
+def _is_finite_box(x1, y1, x2, y2) -> bool:
+    """检测框坐标必须是有限实数（过滤 NaN/Inf）。"""
+    return all(math.isfinite(v) for v in (x1, y1, x2, y2))
 
 # 标签 → BGR 颜色
 CHAR_COLOR = {
@@ -126,6 +148,58 @@ def flush_db(conn: sqlite3.Connection, pending: list):
     pending.clear()
 
 
+def predict_with_oom_guard(model, source, imgsz: int,
+                           conf: float, iou: float,
+                           half: bool, verbose: bool = False,
+                           agnostic_nms: bool = True):
+    """
+    包装 YOLO 推理：显存不足时自动降级，避免程序直接中断。
+    降级顺序：
+      1) 在 GPU 上将 imgsz 减半后重试（不低于 OOM_MIN_IMGSZ）
+      2) 若仍 OOM，则切换到 CPU 重试
+
+    返回: (results, used_imgsz, used_device)
+    """
+    # 仅在有 CUDA 时尝试 GPU
+    gpu_available = torch.cuda.is_available()
+    device = 0 if gpu_available else "cpu"
+    cur_imgsz = int(imgsz)
+    cur_half = bool(half and device != "cpu")
+
+    while True:
+        try:
+            results = model.predict(
+                source=source,
+                imgsz=cur_imgsz,
+                conf=conf,
+                iou=iou,
+                half=cur_half,
+                agnostic_nms=agnostic_nms,
+                verbose=verbose,
+                device=device,
+            )
+            return results, cur_imgsz, device
+
+        except torch.OutOfMemoryError:
+            if device == "cpu":
+                # CPU 上也 OOM，直接抛出让上层处理
+                raise
+
+            # 清理 CUDA 缓存，尝试减小 imgsz 重试
+            torch.cuda.empty_cache()
+
+            next_imgsz = max(OOM_MIN_IMGSZ, cur_imgsz // 2)
+            if next_imgsz < cur_imgsz:
+                print(f"[OOM] CUDA 显存不足，imgsz {cur_imgsz} -> {next_imgsz} 后重试")
+                cur_imgsz = next_imgsz
+                continue
+
+            # 已降到最小尺寸仍 OOM，回退 CPU
+            print("[OOM] CUDA 显存仍不足，切换到 CPU 推理（速度会变慢）")
+            device = "cpu"
+            cur_half = False
+
+
 def run_batch_infer(batch_buf: list, model, class_names: dict,
                     regions: list, video_stem: str,
                     db_pending: list) -> dict:
@@ -151,7 +225,8 @@ def run_batch_infer(batch_buf: list, model, class_names: dict,
     # 批量推理
     infer_map: dict[int, list] = {}   # buf_index -> dets
     if crops:
-        res_list = model.predict(
+        res_list, _used_imgsz, _used_device = predict_with_oom_guard(
+            model=model,
             source=crops,
             imgsz=TARGET_WIDTH,
             conf=CONF_THRESH,
@@ -168,6 +243,8 @@ def run_batch_infer(batch_buf: list, model, class_names: dict,
                     cls_id = int(box.cls[0])
                     conf   = float(box.conf[0])
                     bx1, by1, bx2, by2 = box.xyxy[0].tolist()
+                    if not _is_finite_box(bx1, by1, bx2, by2):
+                        continue
                     dets.append((class_names[cls_id], conf, bx1, by1, bx2, by2))
             infer_map[buf_i] = dets
 
@@ -218,12 +295,13 @@ def _render_region_row(crop_view, region_idx, dets, panel_w=280):
     # 1) 在放大图上画检测框
     if best is not None:
         label, conf, bx1, by1, bx2, by2 = best
-        box_color = CHAR_COLOR.get(label, DEFAULT_CHAR_COLOR) if label else DEFAULT_CHAR_COLOR
-        cv2.rectangle(
-            crop_view,
-            (int(bx1), int(by1)), (int(bx2), int(by2)),
-            box_color, 2,
-        )
+        if _is_finite_box(bx1, by1, bx2, by2):
+            box_color = CHAR_COLOR.get(label, DEFAULT_CHAR_COLOR) if label else DEFAULT_CHAR_COLOR
+            cv2.rectangle(
+                crop_view,
+                (int(bx1), int(by1)), (int(bx2), int(by2)),
+                box_color, 2,
+            )
 
     # 2) 右侧信息面板（深灰背景）
     panel = np.full((h, panel_w, 3), 28, dtype=np.uint8)
@@ -450,7 +528,8 @@ for video_path in video_files:
                         new_h = round(rh_orig * TARGET_WIDTH / rw_orig)
                         upscaled = cv2.resize(crop, (TARGET_WIDTH, new_h),
                                               interpolation=_interp_flag)
-                        results = model.predict(
+                        results, _used_imgsz, _used_device = predict_with_oom_guard(
+                            model=model,
                             source=upscaled,
                             imgsz=TARGET_WIDTH,
                             conf=CONF_THRESH,
@@ -466,6 +545,8 @@ for video_path in video_files:
                                 cls_id = int(box.cls[0])
                                 conf   = float(box.conf[0])
                                 bx1, by1, bx2, by2 = box.xyxy[0].tolist()
+                                if not _is_finite_box(bx1, by1, bx2, by2):
+                                    continue
                                 dets.append((class_names[cls_id], conf,
                                              bx1, by1, bx2, by2))
                         last_detections.append(dets)

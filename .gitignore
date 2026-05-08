@@ -1,1 +1,13 @@
 cropped_data.zip
+cropped_data/
+test_dataset/
+orgin-video/
+orgin_video_0915/
+orgin_video_0922/
+*.MP4
+*.mp4
+*.mov
+*.avi
+*.json
+*.jpg
+*.png

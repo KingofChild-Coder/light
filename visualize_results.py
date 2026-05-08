@@ -18,7 +18,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 import numpy as np
 
 # ───── 配置 ─────────────────────────────────────────────────
-DB_PATH     = Path("infer_results.db")
+DB_PATH     = Path("infer_results_0901.db")
 WINDOW_TITLE = "Traffic Light Detection Timeline"
 # ─────────────────────────────────────────────────────────────
 

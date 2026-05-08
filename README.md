@@ -142,3 +142,27 @@ python visualize_results.py
 | `R` | 红色 | 红灯 |
 | `G` | 绿色 | 绿灯 |
 | `None` | 灰色 | 该帧无检测 |
+
+---
+
+## compare_human_model.py — 手工结果对比
+
+读取手工标注的 `*_tag.csv`，把每条手工时间点对齐到数据库里同一视频最近的模型结果，输出标签一致率和时间误差。
+
+### 运行
+
+对单个文件：
+
+```bash
+python compare_human_model.py "/media/zekai/Expansion/Experiment data CHAO_MAI/2025_9_1/DJI_0439_tag.csv"
+```
+
+对整个目录批量比较：
+
+```bash
+python compare_human_model.py "/media/zekai/Expansion/Experiment data CHAO_MAI/2025_9_1"
+```
+
+如果需要只比某个区域，可以加 `--region-idx`；如果想导出逐条对比结果，可以加 `--output compare.csv`。
+
+如果要按数据库里的所有视频片段批量对比，并自动去目录里找同名标注文件，可以加 `--all-db`。
